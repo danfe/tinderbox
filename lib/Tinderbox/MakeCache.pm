@@ -68,7 +68,12 @@ sub _execMake {
 
         $tmp = '-V ' . join(' -V ', @makeTargets);
         my $dir = $self->{BASEDIR} . '/' . $port;
-        my $cmd = "cd $dir && make $tmp";
+        my $flavor;
+        if ($dir =~ /@([\da-z_]+)$/) {
+                $dir = $`;
+                $flavor = "FLAVOR=$+";
+        }
+        my $cmd = "cd $dir && make $tmp $flavor";
         $cmd = "chroot $self->{CHROOT} /bin/sh -c '$cmd'";
 
         @ret = split("\n", `$cmd`);

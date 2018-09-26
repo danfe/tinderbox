@@ -150,6 +150,7 @@ while (scalar(@PORTS)) {
         next if (defined($pkgdir{$portdir}));
 
         $tportdir = "$chroot$portbase/$portdir";
+q^
         if (!-d $tportdir) {
                 print STDERR "ERROR: Directory $tportdir does not exist.\n";
                 if (defined($pkgdeps{$portdir})
@@ -160,6 +161,7 @@ while (scalar(@PORTS)) {
                 }
                 cleanup($ds, 1, undef);
         }
+^ if 0;
         $pkgname = $makecache->PkgName($portdir);
 
         # Create a list of duds (ports that will not be attempted because they

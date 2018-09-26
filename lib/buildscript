@@ -136,7 +136,11 @@ del_pkg() {
   find /var/db/pkg -type f -empty -delete
 }
 
-dir=$1
+dir=${1%@*}
+if [ $1 != $dir ]; then
+  flavor=${1#*@}
+  export FLAVOR=$flavor
+fi
 phase=$2
 
 ED=$3
