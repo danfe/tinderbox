@@ -322,7 +322,7 @@ updateTree () {
 #---------------------------------------------------------------------------
 
 Setup () {
-    MAN_PREREQS="lang/perl5.[81]*"
+    MAN_PREREQS="lang/perl5.*"
     OPT_PREREQS="lang/php[45] www/php[45]-session archivers/p5-Compress-Bzip2"
     PREF_FILES="tinderbox.ph"
     README="$(tinderLoc scripts README)"
