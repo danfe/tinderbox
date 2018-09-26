@@ -116,19 +116,19 @@ del_pkg() {
         echo "error in pkg_delete, exiting"
         cleanup 0
       else
-        for j in ${delpkg}; do
-          echo "Deleting ${j}"
-          if [ -n "${use_pkgng}" ]; then
-            if ! pkg-static delete -y -f ${j}; then
-              echo "--> error in pkg delete, exiting"
-            fi
-          else
+        if [ -n "${use_pkgng}" ]; then
+          if ! pkg-static delete -y -f ${delpkg}; then
+            echo "--> error in pkg delete, exiting"
+          fi
+        else
+          for j in ${delpkg}; do
+            echo "Deleting ${j}"
             if ! (pkg_delete -f $j); then
               echo "--> error in pkg_delete, exiting"
               cleanup 0
             fi
-          fi
-        done
+          done
+        fi
         dellist=$delpkg
       fi
     done
