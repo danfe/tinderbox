@@ -1,0 +1,556 @@
+#!/bin/sh
+#
+# $MCom: portstools/tinderbox/lib/portbuild,v 1.158 2014/02/22 23:05:38 marcus Exp $
+
+. ${pb}/scripts/lib/tinderlib.sh
+
+usage () {
+    echo "usage: $0 <build name> <jail name> <portstree name> [-noclean] [-plistcheck] [-nullfs] [-fetch-original] [-nolog] [-logdir DIR] [-docopy] [-compress-logs] [-notest] ED PD FD BD RD TD PKGD pkgname dirname"
+    exit 1
+}
+
+jail_ipv4 ()
+{
+    [ "${PORTBUILD_USE_IPV4}" != "NO" ] && echo $1
+}
+jail_ipv6 ()
+{
+    [ "${PORTBUILD_USE_IPV6}" != "NO" ] && echo $1
+}
+
+cleanup()
+{
+    chroot=$1
+    noclean=$2
+    error=$3
+    cleandirs=$4
+    pkgname=$5
+    build=$6
+    nullfs=$7
+
+    jname=j$(echo ${build} | sed -E -e 's|\.||g')
+
+    jexec -U root ${jname} /usr/sbin/service ldconfig start
+
+    jail -r ${jname}
+
+    umount ${chroot}/compat/linux/proc >/dev/null
+    umount ${chroot}/proc >/dev/null
+
+    if [ $noclean -eq 0 ]; then
+	if [ "${error}" = "0" ]; then
+	    for dir in ${cleandirs}
+	    do
+	        cleanDirs ${build} ${chroot}${dir}
+	    done
+	    rm -rf ${chroot}/tmp/*
+	else
+	    ${tc} resetBuild -b ${build} ${nullfs}
+	fi
+    fi
+
+    echo "$pkgname done at `date`"
+    ${tc} updateBuildCurrentPort -b ${build}
+    ${tc} updateBuildRemakeCount -b ${build} -d
+    exit $error
+}
+
+mark_failed() {
+    tc=$1
+    branch=$2
+    pkgname=$3
+    portdir=$4
+
+    mf="${pb}/builds/${branch}/Makefile"
+    if [ ! -f "${mf}" ]; then
+	return
+    fi
+
+    dependents=$(grep ${pkgname} ${mf} | grep '^[[:space:]]\{1,\}@' | awk '{print $NF}' | sed -e 's|^/usr/ports/||' | grep -v ${portdir})
+    if [ $? -ne 0 ]; then
+	return
+    fi
+
+    for dep in ${dependents}; do
+	${tc} updatePortStatus -d ${dep} -b ${branch} -L -s DEPEND -p ${portdir}
+    done
+}
+
+#---------------------------------------------------------------------------
+
+error=0
+init=0
+noclean=0
+nullfs=""
+fetchorig=0
+nolog=0
+plistcheck=""
+nice=0
+logdir=""
+docopy=0
+compress_logs=0
+notest=0
+
+# check parameter count
+if [ $# -lt 10 ]; then
+    usage
+fi
+
+# argument processing
+
+# first, strip off the first 3 components as {build,jail,portstree}
+build=$1
+jail=$2
+portstree=$3
+shift 3
+
+# process -arguments in any order.  previously, the code expected to
+# see arguments in a very specific way, and silently did weird and
+# wonderful things if they weren't
+doneargs=0
+while [ $# -gt 0 -a ${doneargs} -eq 0 ]; do
+
+    case "x$1" in
+
+    x-noclean)		noclean=1
+			shift;;
+
+    x-plistcheck)	plistcheck="plistcheck"
+			shift;;
+
+    x-nullfs)		nullfs="-n"
+			shift;;
+
+    x-fetch-original)	fetchorig=1
+			shift;;
+
+    x-nolog)		nolog=1
+			shift;;
+
+    x-logdir)
+    			shift
+    			logdir=$1
+			shift;;
+    x-docopy)
+    			docopy=1
+			shift;;
+    x-compress-logs)
+    			compress_logs=1
+			shift;;
+    x-notest)
+	                notest=1
+			shift;;
+
+    x-*)		echo "portbuild: unknown argument: $1"
+			exit 1;;
+
+    *)			doneargs=1;;
+
+    esac
+done
+
+# Finally, strip off the dependency lists, package name, and port directory
+ED=$1
+PD=$2
+FD=$3
+BD=$4
+RD=$5
+TD=$6
+PKGD=$7
+pkgname=$(basename $8 ${PKGSUFFIX})
+dirname=$9
+
+echo ${pkgname}
+echo ${dirname}
+
+tc=$(tinderLoc scripts tc)
+chroot=$(tinderLoc buildroot ${build})
+echo "chroot is: ${chroot}"
+jname=j$(echo ${build} | sed -E -e 's|\.||g')
+echo "jailname is: ${jname}"
+portdir=$(echo ${dirname} | sed -e 's|^/usr/ports/||')
+
+# set PORTBUILD_USE_IPV6 to NO, host doesn't have ipv6
+if /sbin/sysctl -n net.inet6 >/dev/null 2>&1 ; then
+    PORTBUILD_USE_IPV6=YES
+else
+    PORTBUILD_USE_IPV6=NO
+fi
+
+total_size=$(${tc} getPortTotalSize -d ${portdir} -b ${build})
+execute_hook "prePortBuild" "PACKAGE_NAME=${pkgname} BUILD=${build} JAIL=${jail} PORTSTREE=${portstree} CHROOT=${chroot} PORTDIR=${portdir} PB=${pb} TOTAL_SIZE=${total_size}"
+if [ $? -ne 0 ]; then
+    echo "portbuild: Terminating build for ${pkgname} since prePortBuild hook failed"
+    ${tc} updatePortStatus -d ${portdir} -b ${build} -L -s FAIL -v ${pkgname} -r "hook"
+    mark_failed ${tc} ${build} ${pkgname} ${portdir}
+    exit 1
+fi
+
+dudsfile=$(tinderLoc builddata ${build})/duds
+if [ -f ${dudsfile} ]; then
+    if grep -qxF ${pkgname} ${dudsfile}; then
+        echo "skipping ${pkgname} (found in duds)"
+	${tc} updatePortStatus -d ${portdir} -b ${build} \
+		-L -s DUD -v ${pkgname}
+	mark_failed ${tc} ${build} ${pkgname} ${portdir}
+	execute_hook "postPortBuild" "PACKAGE_NAME=${pkgname} BUILD=${build} JAIL=${jail} PORTSTREE=${portstree} CHROOT=${chroot} STATUS=DUD PORTDIR=${portdir} PB=${pb} FAIL_REASON=dud TOTAL_SIZE=0"
+        exit 1
+    fi
+fi
+
+# directories to clean
+cleandirs="${LOCALBASE} /compat /var/db/pkg"
+
+for dir in ${cleandirs}; do
+    cleanDirs ${build} ${chroot}${dir}
+done
+rm -rf ${chroot}/var/db/pkg/*
+
+# reset mtrees for plist checking
+mtree -deU -f ${chroot}/etc/mtree/BSD.root.dist \
+      -p ${chroot} >/dev/null 2>&1
+mtree -deU -f ${chroot}/etc/mtree/BSD.var.dist \
+      -p ${chroot}/var >/dev/null 2>&1
+mtree -deU -f ${chroot}/etc/mtree/BSD.usr.dist \
+      -p ${chroot}/usr >/dev/null 2>&1
+
+use_pkgng=$(make -f ${chroot}/a/ports/Mk/bsd.port.mk -VWITH_PKGNG)
+
+mkdir -p ${chroot}${LOCALBASE}
+if [ -f ${chroot}/a/ports/Templates/BSD.local.dist ]; then
+    mtree -deU -f ${chroot}/a/ports/Templates/BSD.local.dist -p ${chroot}${LOCALBASE} \
+    	>/dev/null 2>&1
+else
+    mtree -deU -f ${chroot}/etc/mtree/BSD.local.dist -p ${chroot}${LOCALBASE} \
+    	>/dev/null 2>&1
+fi
+
+# mount linprocfs if required
+if [ "${ARCH}" = "i386" -o "${ARCH}" = "amd64" ]; then
+    mkdir -p ${chroot}/compat/linux/proc
+    mount -t linprocfs linprocfs ${chroot}/compat/linux/proc
+fi
+
+# mount procfs
+mkdir -p ${chroot}/proc
+mount -t procfs procfs ${chroot}/proc
+
+# Want to use the /etc/make.conf in the chroot (Jail)
+unset __MAKE_CONF
+unset SRCCONF
+
+export WRKDIRPREFIX=/work
+export DISTDIR=/tmp/distfiles
+export PACKAGES=/tmp/packages
+
+export TINDERBOX_BUILDING=1
+
+# don't pass -j, -k etc. to sub-makes
+unset MAKEFLAGS
+unset PORTSDIR
+unset SRCBASE
+
+# Unset all of the locale variables to ensure C/POSIX is used to build
+# everything.
+unset LC_ALL
+unset LC_TIME
+unset LC_CTYPE
+unset LC_MONETARY
+unset LC_COLLATE
+unset LC_MESSAGES
+unset LC_NUMERIC
+unset LANG
+
+# wait 2 hours before killing build with no output
+export TIMEOUT=7200
+
+# to prevent runaway processes -- 800 meg file size limit, two hour CPU limit
+ulimit -f 16384000
+ulimit -t 7200
+
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin:${LOCALBASE}/sbin:${LOCALBASE}/bin
+
+# Set HOME to be /root to avoid errant leftover files
+export HOME=/root
+
+if [ x"${CCACHE_ENABLED}" = x"1" ]; then
+    # XXX We need to do this since certain ports (e.g. cdrtools) don't
+    # respect CC the way they should (thanks for the tip, Adam).
+    export PATH=/opt:${PATH}
+fi
+
+if [ x"${OPTIONS_ENABLED}" = x"1" ]; then
+    export PORT_DBDIR=/var/db/ports
+fi
+
+if [ ${notest} -eq 1 ]; then
+    export TB_SKIP_TESTS=1
+fi
+
+# jexec -U root will have the right arch in uname -m and uname -p
+LOGIN_ENV=",UNAME_p=${ARCH},UNAME_m=${ARCH}"
+sed -i "" -e "s/:\(setenv.*\):/:\1${LOGIN_ENV}:/" ${chroot}/etc/login.conf
+cap_mkdb ${chroot}/etc/login.conf
+
+cat >> ${chroot}/etc/make.conf << EOF
+ARCH=${ARCH}
+MACHINE=${ARCH}
+MACHINE_ARCH=${ARCH}
+EOF
+
+echo "building $pkgname in $chroot"
+
+${tc} updateBuildStatus -b ${build} -s PORTBUILD
+${tc} updateBuildCurrentPort -b ${build} -d ${portdir} -n ${pkgname}
+
+packages=$(tinderLoc packages ${build})
+major_version=$(echo ${jail} | sed -E -e 's|(^[[:digit:]]+).*$|\1|')
+
+if [ -n "${DISTFILE_CACHE}" ]; then
+    export DISTCACHE=/distcache
+    if [ ${fetchorig} -eq 0 ]; then
+        _MSO='file:///distcache/${DIST_SUBDIR}/'
+        export MASTER_SITE_OVERRIDE="${_MSO} ${MASTER_SITE_OVERRIDE}"
+    fi
+fi
+
+if [ -n "${DISTFILE_URI}" ]; then
+    _MSO=$(printf '%s/${DIST_SUBDIR}/' ${DISTFILE_URI})
+    export MASTER_SITE_OVERRIDE="${_MSO} ${MASTER_SITE_OVERRIDE}"
+fi
+
+rm -rf ${chroot}/tmp/*
+mkdir -p ${chroot}/tmp/depends ${chroot}/tmp/distfiles ${chroot}/tmp/packages
+
+echo "building ${pkgname} in directory ${chroot}" | \
+    tee ${chroot}/tmp/${pkgname}.log
+
+trap  "cleanup ${chroot} ${noclean} ${error} \"${cleandirs}\" ${pkgname} ${build} ${nullfs}" 1 2 3 9 10 11 15
+
+# Don't build in a world-writable standard directory because some ports
+# hardcode this path and try to load things from it at runtime, which is
+# bad for user security
+rm -rf ${chroot}/${WRKDIRPREFIX}
+mkdir -p ${chroot}/${WRKDIRPREFIX}
+
+if [ x"${CCACHE_ENABLED}" ]; then
+    unset CCACHE_DISABLE
+fi
+
+# Start a jail 
+# XXX bapt: the network 127.0.0.1 allows ports like postfix do not fail querying a network
+# device
+jail -c persist name=${jname} path=${chroot} host.hostname=${jname} \
+    $(jail_ipv4 ip4.addr=127.0.0.1) \
+    $(jail_ipv6 ip6.addr=::1) \
+    allow.sysvipc allow.socket_af allow.raw_sockets allow.chflags
+error=$?
+if [ ${error} -ne 0 ]; then
+    echo "portbuild: Start of jail ${jname} failed with return code ${error}"
+    cleanup ${chroot} ${noclean} ${error} "${cleandirs}" ${pkgname} ${build} ${nullfs}
+fi
+jexec -U root ${jname} /usr/sbin/service ldconfig start
+
+set x $ED $FD $PD $BD $RD $TD $PKGD
+shift 1
+
+cd ${chroot}/tmp/depends
+
+# restart the jail with network for the fetch part
+jail -r ${jname}
+jail -c persist name=${jname} path=${chroot} host.hostname=${jname} \
+	$(jail_ipv4 ip4=inherit) \
+	$(jail_ipv6 ip6=inherit) \
+	allow.sysvipc allow.socket_af allow.raw_sockets allow.chflags
+error=$?
+if [ ${error} -ne 0 ]; then
+    echo "portbuild: Start of jail ${jname} failed with return code ${error}"
+    cleanup ${chroot} ${noclean} ${error} "${cleandirs}" ${pkgname} ${build} ${nullfs}
+fi
+
+while [ $# -gt 0 ]; do
+
+    if [ ! -f $1 -a -n "${PACKAGE_URI}" ]; then
+	echo "fetching package $1 for ${pkgname}"
+	jexec -U root ${jname} "cd /tmp/depends && fetch ${PACKAGE_URI}/${build}/All/$1"
+    fi
+
+    if [ ! -f $1 -a -f ${packages}/All/$1 ]; then
+	echo "copying package $1 for ${pkgname}"
+	cp -p ${packages}/All/$1 .
+    fi
+
+    if [ ! -f $1 ]; then
+	echo "skipping package $1 for ${pkgname} since it is missing"
+    fi
+
+    shift
+done
+
+execute_hook "prePortChecksum" "PACKAGE_NAME=${pkgname} BUILD=${build} JAIL=${jail} PORTSTREE=${portstree} CHROOT=${chroot} PORTDIR=${portdir} PB=${pb} TOTAL_SIZE=${total_size}"
+if [ $? -ne 0 ]; then
+    echo "portbuild: Terminating build for ${pkgname} since prePortChecksum hook failed"
+    ${tc} updatePortStatus -d ${portdir} -b ${build} -L -s FAIL -v ${pkgname} -r "hook"
+    mark_failed ${tc} ${build} ${pkgname} ${portdir}
+    exit 1
+fi
+
+jexec -U root ${jname} /buildscript ${dirname} 1 "$ED" "$PD" "$FD" "$BD" "$RD" "$TD" "$PKGD" "${plistcheck}" 2>&1 | tee -a ${chroot}/tmp/${pkgname}.log
+jail -r ${jname}
+jail -c persist name=${jname} path=${chroot} host.hostname=${jname} \
+	$(jail_ipv4 ip4.addr=127.0.0.1) \
+	$(jail_ipv6 ip6.addr=::1) \
+	allow.sysvipc allow.socket_af allow.raw_sockets allow.chflags
+error=$?
+if [ ${error} -ne 0 ]; then
+    echo "portbuild: Start of jail ${jname} failed with return code ${error}"
+    cleanup ${chroot} ${noclean} ${error} "${cleandirs}" ${pkgname} ${build} ${nullfs}
+fi
+if [ -f ${chroot}/tmp/status ]; then
+    error=$(cat ${chroot}/tmp/status)
+else
+    error=255
+fi
+execute_hook "postPortChecksum" "PACKAGE_NAME=${pkgname} BUILD=${build} JAIL=${jail} PORTSTREE=${portstree} CHROOT=${chroot} PORTDIR=${portdir} ERROR=${error} PB=${pb} TOTAL_SIZE=${total_size}"
+
+last_version=$(${tc} getPortLastBuiltVersion -d ${portdir} -b ${build})
+logsDir=$(tinderLoc buildlogs ${build})
+errorsDir=$(tinderLoc builderrors ${build})
+
+if [ "${error}" = "0" ]; then
+    ln -sf ${pkgname}.log2 ${chroot}/tmp/make.log
+    # Cache the distfiles if requested.  We will wait a maximum of
+    # ten minutes before giving up on the lock.
+    if [ -n "${DISTFILE_CACHE}" -a -n "${DISTCACHE}" ]; then
+	lockf -t 600 ${chroot}${DISTCACHE}/.lock tar -C ${chroot}/${DISTDIR} \
+	    -cf - . | tar --unlink -C ${chroot}${DISTCACHE} -xvf -
+    fi
+
+    if [ -n "${PREFIX}" -a "${PREFIX}" != "/usr/local" ]; then
+        jexec -U root ${jname} env LOCALBASE=${LOCALBASE:-/usr/local} PREFIX=${PREFIX} PATH=${LOCALBASE}/bin:${LOCALBASE}/sbin:${PATH} /usr/bin/nice -n $nice /buildscript ${dirname} 2 "$ED" "$PD" "$FD" "$BD" "$RD" "$TD" "$PKGD" "${plistcheck}" > ${chroot}/tmp/${pkgname}.log2 2>&1
+    else
+	jexec -U root ${jname} env LOCALBASE=${LOCALBASE:-/usr/local} PATH=${LOCALBASE}/bin:${LOCALBASE}/sbin:${PATH} /usr/bin/nice -n $nice /buildscript ${dirname} 2 "$ED" "$PD" "$FD" "$BD" "$RD" "$TD" "$PKGD" "${plistcheck}" > ${chroot}/tmp/${pkgname}.log2 2>&1
+    fi
+
+    grep pnohang ${chroot}/tmp/${pkgname}.log2
+    cat ${chroot}/tmp/${pkgname}.log2 >> ${chroot}/tmp/${pkgname}.log
+    rm ${chroot}/tmp/${pkgname}.log2
+
+    lext=""
+    if [ ${compress_logs} -ne 0 ]; then
+	bzip2 -c ${chroot}/tmp/${pkgname}.log > ${logsDir}/${pkgname}.log.bz2
+	lext=".bz2"
+    else
+        cp ${chroot}/tmp/${pkgname}.log ${logsDir}/${pkgname}.log
+    fi
+    if [ -n "${logdir}" ]; then
+	if [ ${docopy} -eq 1 ]; then
+	    cp ${logsDir}/${pkgname}.log${lext} ${logdir}/${pkgname}.log${lext}
+	else
+	    ln -s ${logsDir}/${pkgname}.log${lext} ${logdir}/${pkgname}.log${lext}
+	fi
+    fi
+    error=$(cat ${chroot}/tmp/status)
+
+    #jail -r ${jname}
+#    rm -rf ${chroot}/${WRKDIRPREFIX}
+
+    if [ -e ${chroot}/tmp/work.tbz ]; then
+	workDir=$(tinderLoc buildworkdir ${build})
+	mkdir -p ${workDir}
+	cp ${chroot}/tmp/work.tbz ${workDir}/${pkgname}.tbz
+    fi
+
+    if [ "${error}" = "0" ]; then
+        if [ ! -z "${last_version}" ]; then
+	    oldpkgs=$(find ${packages}/* -name "${last_version}${PKGSUFFIX}")
+	    for _pkg in ${oldpkgs}; do
+	        echo "${build}: Removing old package ${_pkg}."
+	        rm -f ${_pkg}
+	    done
+        fi
+	tar -C ${chroot}/tmp/packages -cf - . | \
+		tar --unlink -C ${packages} -xvf -
+	[ -f ${packages}/All/${pkgname}${PKGSUFFIX} ] && \
+		touch ${packages}/All/${pkgname}${PKGSUFFIX}
+	rm -f ${errorsDir}/${pkgname}.log*
+	if bzgrep -q "${pkgname} is marked as broken: " ${logsDir}/${pkgname}.log${lext} ; then
+	    status="BROKEN"
+	elif [ -f ${chroot}/tmp/leftovers ]; then
+	    status="LEFTOVERS"
+	else
+	    status="SUCCESS"
+	fi
+	total_size=0
+	if [ -f ${chroot}/tmp/size ]; then
+	    total_size=$(cat ${chroot}/tmp/size)
+	fi
+	${tc} updatePortStatus -d ${portdir} -b ${build} \
+		-L -S -s ${status} -v ${pkgname} -r "__nofail__" \
+		-t ${total_size}
+	execute_hook "postPortBuild" "PACKAGE_NAME=${pkgname} BUILD=${build} JAIL=${jail} PORTSTREE=${portstree} CHROOT=${chroot} STATUS=${status} PORTDIR=${portdir} PB=${pb} TOTAL_SIZE=${total_size}"
+	if [ ${status} = "LEFTOVERS" ]; then
+	    ${tc} sendBuildErrorMail -d ${portdir} -b ${build} -p ${pkgname} ${lext:+-x ${lext}} -l
+	fi
+    else
+	ln -f ${logsDir}/${pkgname}.log${lext} ${errorsDir}/${pkgname}.log${lext}
+	reason=""
+	reasonenv=""
+	if [ ${nolog} -eq 0 ]; then
+	    reasontxt=$(${tc} processLog -l ${logsDir}/${pkgname}.log${lext})
+	    reason="-r ${reasontxt}"
+	    reasonenv="FAIL_REASON=${reasontxt}"
+	fi
+	total_size=0
+	if [ -f ${chroot}/tmp/size ]; then
+	    total_size=$(cat ${chroot}/tmp/size)
+	fi
+	old_size=$(${tc} getPortTotalSize -d ${portdir} -b ${build})
+	if [ -z "${old_size}" ]; then
+	    old_size=0
+	fi
+	if [ ${old_size} -gt ${total_size} ]; then
+	    total_size=${old_size}
+	fi
+	${tc} updatePortStatus -d ${portdir} -b ${build} \
+		-L -s FAIL -v ${pkgname} ${reason} -t ${total_size}
+	mark_failed ${tc} ${build} ${pkgname} ${portdir}
+        ${tc} sendBuildErrorMail -d ${portdir} -b ${build} -p ${pkgname} ${lext:+-x ${lext}}
+	execute_hook "postPortBuild" "PACKAGE_NAME=${pkgname} BUILD=${build} JAIL=${jail} PORTSTREE=${portstree} CHROOT=${chroot} STATUS=FAIL PORTDIR=${portdir} PB=${pb} ${reasonenv} TOTAL_SIZE=${total_size}"
+    fi
+    rm -rf ${chroot}/${WRKDIRPREFIX}
+else
+    lext=""
+    if [ ${compress_logs} -ne 0 ]; then
+	bzip2 -c ${chroot}/tmp/${pkgname}.log > ${logsDir}/${pkgname}.log.bz2
+	ln -f ${logsDir}/${pkgname}.log.bz2 ${errorsDir}/${pkgname}.log.bz2
+	lext=".bz2"
+    else
+        cp ${chroot}/tmp/${pkgname}.log ${logsDir}/${pkgname}.log
+        ln -f ${logsDir}/${pkgname}.log ${errorsDir}/${pkgname}.log
+    fi
+
+    reason=""
+    reasonenv=""
+    if [ ${nolog} -eq 0 ]; then
+	reasontxt=$(${tc} processLog -l ${logsDir}/${pkgname}.log${lext})
+        reason="-r ${reasontxt}"
+	reasonenv="FAIL_REASON=${reasontxt}"
+    fi
+    total_size=0
+    if [ -f ${chroot}/tmp/size ]; then
+	total_size=$(cat ${chroot}/tmp/size)
+    fi
+    old_size=$(${tc} getPortTotalSize -d ${portdir} -b ${build})
+    if [ ${old_size} -gt ${total_size} ]; then
+	total_size=${old_size}
+    fi
+    ${tc} updatePortStatus -d ${portdir} -b ${build} \
+		-L -s FAIL -v ${pkgname} ${reason} -t ${total_size}
+    mark_failed ${tc} ${build} ${pkgname} ${portdir}
+    ${tc} sendBuildErrorMail -d ${portdir} -b ${build} -p ${pkgname} -x ${lext}
+    execute_hook "postPortBuild" "PACKAGE_NAME=${pkgname} BUILD=${build} JAIL=${jail} PORTSTREE=${portstree} CHROOT=${chroot} STATUS=FAIL PORTDIR=${portdir} PB=${pb} ${reasonenv} TOTAL_SIZE=${total_size}"
+fi
+
+cleanup ${chroot} ${noclean} ${error} "${cleandirs}" ${pkgname} ${build} ${nullfs}
+exit ${error}
