@@ -348,7 +348,7 @@ Setup () {
     # Now, check the optional pre-reqs (for web usage).
     missing=$(checkPreReqs ${OPT_PREREQS})
     if [ $? -ne 0 ]; then
-	tinderEcho "WARN: The following option dependencies are missing.  These are required to use the Tinderbox web front-ends."
+	tinderEcho "WARN: The following optional dependencies are missing.  These are required to use the Tinderbox web front-ends."
 	tinderEcho "WARN:  ${missing}"
     fi
 
@@ -2008,6 +2008,13 @@ tinderbuild () {
 	    tinderbuild_cleanup 1
 	fi
     fi
+
+    echo -n "checking package mtimes to avoid needless rebuilds... "
+    while (cd ${pkgDir}/All && make -dm -n \
+	-f ../../../builds/${build}/Makefile all 2>&1 | \
+	python ../../../lib/fixmtimes.py); do
+	    echo -n "rechecking after adjustment round... "
+    done ; echo done
 
     if [ ${onlymake} -eq 1 ]; then
 	echo "onlymake specified: not running tinderbuild"
